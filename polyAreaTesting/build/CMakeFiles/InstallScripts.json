@@ -1,8 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/Users/mattmurden/Documents/POLYMARKET/polyAreaTesting/build/cmake_install.cmake",
-		"/Users/mattmurden/Documents/POLYMARKET/polyAreaTesting/build/_deps/ixwebsocket-build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

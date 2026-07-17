@@ -1,0 +1,28 @@
+# Build output
+build/
+*.o
+*.a
+*.dylib
+*.so
+compile_commands.json
+
+# macOS
+.DS_Store
+
+# Editor/IDE
+.vscode/
+.idea/
+
+# Collected data / run output (not source)
+results/
+*.csv
+*.jsonl
+*.log
+
+# Local config that may contain a real RPC URL/API key
+config/local.ini
+config/*.local.ini
+
+# Env files that might carry secrets (API keys, RPC URLs)
+.env
+.env.*
