@@ -22,9 +22,11 @@
 #include <fstream>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "config.hpp"
+#include "discovery.hpp"
 #include "logging.hpp"
 #include "ntp_check.hpp"
 #include "resolve.hpp"
@@ -169,6 +171,85 @@ bool ntpGateOrExit(const AppConfig& cfg) {
     return false;
 }
 
+// --- asset auto-discovery -------------------------------------------------
+// Fixed timeout for discovery HTTP calls -- not exposed as a flag since the
+// spec calls for sample-size/top-n/refresh-interval knobs, not a separate
+// timeout; matches the RPC client's default order of magnitude.
+constexpr long kDiscoveryTimeoutMs = 8000;
+
+// Runs the initial discovery call and populates cfg->asset_ids from it.
+// Logs exactly which asset ids (and their trade counts in the sample) were
+// selected, so a run is reproducible/debuggable after the fact. Returns
+// false if discovery failed outright -- callers should exit non-zero
+// rather than silently falling back to an empty subscription list.
+bool runInitialDiscoveryOrExit(AppConfig* cfg) {
+    logging::info("auto-discover-assets: sampling " + std::to_string(cfg->discover_trade_sample_size) +
+                  " recent trades to pick the top " + std::to_string(cfg->discover_top_n) +
+                  " currently active asset(s)...");
+    auto discovered = discoverActiveAssets(cfg->discover_trade_sample_size, cfg->discover_top_n,
+                                            kDiscoveryTimeoutMs);
+    if (!discovered) {
+        logging::error("auto-discover-assets: could not determine an active asset list (see "
+                       "discovery errors above). Pass --asset-ids explicitly instead if this "
+                       "keeps happening.");
+        return false;
+    }
+
+    cfg->asset_ids.clear();
+    std::string summary;
+    for (const auto& d : *discovered) {
+        cfg->asset_ids.push_back(d.asset_id);
+        summary += "\n  " + d.asset_id + " (" + std::to_string(d.trade_count) + " trades in sample)";
+    }
+    logging::info("auto-discover-assets: selected " + std::to_string(cfg->asset_ids.size()) +
+                  " asset id(s):" + summary);
+    return true;
+}
+
+// Periodic re-discovery for long runs: markets like the 5-minute BTC/ETH/
+// XRP up/down markets roll over every few minutes, so a snapshot taken only
+// at startup goes stale well before a multi-day run ends. Diffs the newly
+// discovered top-N set against what's currently subscribed, logs every
+// add/drop with its reason, and reconnects (via WsListener::resubscribe)
+// only if the set actually changed. Failures here are logged and skipped
+// rather than fatal -- unlike the startup call, an unattended run shouldn't
+// die over one transient HTTP hiccup hours in; it just tries again next
+// interval, keeping the current subscription in the meantime.
+void refreshDiscoveredAssets(const AppConfig& cfg, WsListener* ws) {
+    auto discovered = discoverActiveAssets(cfg.discover_trade_sample_size, cfg.discover_top_n,
+                                            kDiscoveryTimeoutMs);
+    if (!discovered) {
+        logging::error("discovery refresh failed; keeping the current asset subscription "
+                       "unchanged (will retry at the next refresh interval)");
+        return;
+    }
+
+    std::vector<std::string> newIds;
+    newIds.reserve(discovered->size());
+    for (const auto& d : *discovered) newIds.push_back(d.asset_id);
+
+    std::vector<std::string> oldIds = ws->currentAssetIds();
+    std::unordered_set<std::string> oldSet(oldIds.begin(), oldIds.end());
+    std::unordered_set<std::string> newSet(newIds.begin(), newIds.end());
+
+    std::vector<std::string> added, dropped;
+    for (const auto& id : newIds) if (!oldSet.count(id)) added.push_back(id);
+    for (const auto& id : oldIds) if (!newSet.count(id)) dropped.push_back(id);
+
+    if (added.empty() && dropped.empty()) {
+        logging::info("discovery refresh: no change to the top-" + std::to_string(cfg.discover_top_n) +
+                      " asset set");
+        return;
+    }
+
+    for (const auto& id : added) logging::info("discovery refresh: adding asset " + id + " (newly active)");
+    for (const auto& id : dropped)
+        logging::info("discovery refresh: dropping asset " + id + " (aged out of top-" +
+                      std::to_string(cfg.discover_top_n) + ")");
+
+    ws->resubscribe(newIds);
+}
+
 // --- raw payload dump mode ------------------------------------------------
 int runDumpRawMessages(const AppConfig& cfg) {
     logging::info("dump-raw-messages mode: writing " + std::to_string(cfg.dump_raw_messages) +
@@ -235,6 +316,14 @@ int main(int argc, char** argv) {
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
     ix::initNetSystem();
+
+    if (cfg.auto_discover_assets) {
+        if (!runInitialDiscoveryOrExit(&cfg)) {
+            ix::uninitNetSystem();
+            curl_global_cleanup();
+            return 1;
+        }
+    }
 
     if (cfg.dump_raw_messages > 0) {
         int rc = runDumpRawMessages(cfg);
@@ -305,6 +394,24 @@ int main(int argc, char** argv) {
         }
     });
 
+    // Only re-discovers on an interval when the asset list came from
+    // --auto-discover-assets in the first place -- a manually-specified
+    // --asset-ids list stays static for the whole run, per spec.
+    std::thread discoveryThread;
+    if (cfg.auto_discover_assets && cfg.discover_refresh_interval_sec > 0) {
+        discoveryThread = std::thread([&] {
+            std::unique_lock<std::mutex> lock(g_stopMutex);
+            while (!g_stopRequested.load()) {
+                g_stopCv.wait_for(lock, std::chrono::seconds(cfg.discover_refresh_interval_sec),
+                                   [] { return g_stopRequested.load(); });
+                if (g_stopRequested.load()) break;
+                lock.unlock();
+                refreshDiscoveredAssets(cfg, &ws);
+                lock.lock();
+            }
+        });
+    }
+
     ws.start();
     logging::info("collection running. SIGINT/SIGTERM for graceful shutdown.");
 
@@ -315,6 +422,7 @@ int main(int argc, char** argv) {
     queue.wakeAll();
     for (auto& t : workers) t.join();
     statsThread.join();
+    if (discoveryThread.joinable()) discoveryThread.join();
 
     logStatsSnapshot(ws, queue, lagStats);
     logging::info("shutdown complete.");

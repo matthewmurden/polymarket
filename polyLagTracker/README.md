@@ -85,21 +85,27 @@ chronyd`) on the deployment host -- the startup NTP check (below) expects
 ## Before your first real run: dump raw payloads
 
 ```
-./poly_lag_tracker --asset-ids <id1>,<id2>,... --dump-raw-messages 50
+./poly_lag_tracker --auto-discover-assets --dump-raw-messages 50
 ```
 
-Connects, subscribes, writes 50 raw WS payloads to `raw_messages.jsonl`
-(one JSON value per line -- some lines are arrays, see above), then exits.
-No RPC calls, no CSV output. Use this after any deploy to a new host or
+One command: picks currently active markets (see "Auto-discovering active
+markets" below), connects, subscribes, writes 50 raw WS payloads to
+`raw_messages.jsonl` (one JSON value per line -- some lines are arrays, see
+above), then exits. No RPC calls, no CSV output, no periodic refresh (dump
+mode is short-lived by design). Use this after any deploy to a new host or
 after a gap in usage to reconfirm the schema notes above still hold before
-trusting `--match-mode auto`/`txhash` output. Get live asset ids to try
-from `https://data-api.polymarket.com/trades?limit=20` (field `"asset"`).
+trusting `--match-mode auto`/`txhash` output.
+
+If you'd rather pin a specific market instead of letting discovery pick,
+pass `--asset-ids <id1>,<id2>,...` instead (get live ids from
+`https://data-api.polymarket.com/trades?limit=20`, field `"asset"`) --
+`--asset-ids` always wins over `--auto-discover-assets` if both are given.
 
 ## Run
 
 ```
 ./poly_lag_tracker --config ../config/example.ini \
-  --asset-ids <id1>,<id2>,... \
+  --auto-discover-assets \
   --rpc-url https://your-polygon-rpc-endpoint
 ```
 
@@ -109,13 +115,53 @@ file. See `./poly_lag_tracker --help` for the full flag list, or
 
 | Flag | What |
 |---|---|
-| `--asset-ids` | comma-separated token ids to subscribe to (required) |
+| `--auto-discover-assets` | pick the subscription set from currently active trades (see below) |
+| `--asset-ids` | comma-separated token ids to subscribe to instead of discovering them; wins if both are set |
 | `--rpc-url` | Polygon JSON-RPC endpoint (required unless `--match-mode off`) |
 | `--match-mode` | `auto`\|`txhash` (default)\|`fuzzy`\|`off` |
 | `--output` | CSV path (default `poly_lag.csv`) |
 | `--log-interval-sec` | periodic stats log cadence (default 300 = 5 min) |
 | `--worker-threads` | RPC-resolution workers (default 4) |
 | `--force-unsynced-clock` | override the NTP gate (not recommended) |
+
+### Auto-discovering active markets
+
+Polymarket's highest-volume markets (e.g. the BTC/ETH/XRP 5-minute up/down
+markets) churn and get replaced every few minutes -- confirmed live while
+testing this: an asset id sampled from recent trades can return an empty
+order book within about a minute as its market resolves and a new one takes
+its place. A hand-curated `--asset-ids` list goes stale fast, and there's
+no way to know in advance which markets will actually be active. With
+`--auto-discover-assets`:
+
+- At startup, the tool samples the last `--discover-trade-sample-size`
+  (default 500) trades from `https://data-api.polymarket.com/trades`,
+  counts how often each asset id appears (a proxy for current activity),
+  and subscribes to the top `--discover-top-n` (default 40). Exactly which
+  ids were picked, and their trade counts in the sample, are logged so a
+  run is reproducible/debuggable afterward.
+- Every `--discover-refresh-interval-sec` (default 1800 = 30 min, `0`
+  disables this), it re-samples, diffs the new top-N against what's
+  currently subscribed, and logs every asset added ("newly active") or
+  dropped ("aged out of top-N"). **Confirmed empirically that Polymarket's
+  market-channel WS rejects a second subscribe message on an already-open
+  connection** (the server replies the plain-text string
+  `INVALID OPERATION`, even for an identical resubscribe) -- there is no
+  live add/remove, so when the set actually changes, the tool closes and
+  reopens the WS connection with the updated list rather than trying to
+  patch the existing one. This briefly interrupts the trade stream (a
+  normal reconnect, logged like any other), which is preferable to running
+  with a silently stale subscription.
+- If the discovery HTTP call fails outright (network error, bad JSON, no
+  trades in the sample) at startup, the tool logs the error and exits
+  non-zero rather than silently starting with an empty subscription --
+  there's one retry after a short delay first. A periodic *refresh* that
+  fails is treated less strictly: it's logged and skipped, keeping the
+  current subscription, since a multi-day unattended run shouldn't die
+  over one transient HTTP hiccup hours in.
+- `--asset-ids`, if also given, always wins (auto-discovery is skipped
+  entirely, with a warning) -- use it when you want a fixed, reproducible
+  market set instead of a moving one.
 
 Runs until SIGINT/SIGTERM, which triggers a graceful shutdown: the WS
 stops, in-flight RPC resolutions get a chance to finish (or bail out

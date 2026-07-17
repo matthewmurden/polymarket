@@ -3,6 +3,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,13 @@
 // ix::WebSocket and relies on IXWebSocket's built-in automatic reconnection
 // (exponential backoff between setMinRetryWaitTime/setMaxRetryWaitTime) to
 // recover from drops. Every Open/Close/Error is logged with a timestamp.
+//
+// The subscribed asset set can only be chosen at connection-establishment
+// time: confirmed empirically that sending a second subscribe message on
+// an already-open connection gets rejected by Polymarket's server with a
+// plain-text "INVALID OPERATION" reply, even if the message is identical
+// to the first. There is no live add/remove. resubscribe() below changes
+// the watched set by closing and reopening the connection.
 class WsListener {
 public:
     using TradeCallback = std::function<void(TradeEvent)>;
@@ -36,6 +44,17 @@ public:
     void start();
     void stop();
 
+    // Closes the current connection (if any) and opens a new one
+    // subscribed to newAssetIds -- see class comment for why this can't be
+    // done as a live update on the existing connection. Intended to be
+    // called from a single dedicated refresh thread, not concurrently with
+    // itself. Safe to call after start(); logs a summary line itself, but
+    // per-asset added/dropped reasons are expected to be logged by the
+    // caller (which has the old/new sets to diff) before calling this.
+    void resubscribe(std::vector<std::string> newAssetIds);
+
+    std::vector<std::string> currentAssetIds() const;
+
     uint64_t connectCount() const { return connectCount_.load(); }
     uint64_t disconnectCount() const { return disconnectCount_.load(); }
     uint64_t messagesReceived() const { return messagesReceived_.load(); }
@@ -46,6 +65,7 @@ private:
     std::unique_ptr<Impl> impl_;
 
     std::string url_;
+    mutable std::mutex assetIdsMtx_;
     std::vector<std::string> assetIds_;
     int minBackoffMs_;
     int maxBackoffMs_;

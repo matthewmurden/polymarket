@@ -40,10 +40,16 @@ void printUsage(const char* prog) {
         "  --config PATH                   key=value config file (CLI flags below override it)\n"
         "\n"
         "  --ws-url URL                     Polymarket CLOB market WS URL\n"
-        "  --asset-ids ID1,ID2,...          token/asset ids to subscribe to (required unless --dump-raw-messages)\n"
+        "  --asset-ids ID1,ID2,...          token/asset ids to subscribe to (required unless --auto-discover-assets)\n"
         "  --reconnect-min-backoff-ms N     IXWebSocket min retry wait (default 500)\n"
         "  --reconnect-max-backoff-ms N     IXWebSocket max retry wait (default 30000)\n"
         "  --ping-interval-sec N            WS keepalive ping interval (default 30)\n"
+        "\n"
+        "  --auto-discover-assets           pick the subscription set from currently active trades instead\n"
+        "                                   of a fixed --asset-ids list (ignored if --asset-ids is also set)\n"
+        "  --discover-trade-sample-size N   trades sampled per discovery call (default 500)\n"
+        "  --discover-top-n N               how many of the most-frequent assets to subscribe to (default 40)\n"
+        "  --discover-refresh-interval-sec N  re-run discovery this often, 0 disables refresh (default 1800)\n"
         "\n"
         "  --rpc-url URL                    Polygon JSON-RPC endpoint (required unless --match-mode off)\n"
         "  --rpc-timeout-ms N               per-call RPC timeout (default 8000)\n"
@@ -91,6 +97,10 @@ bool loadConfigFile(const std::string& path, AppConfig* cfg) {
         else if (key == "reconnect_min_backoff_ms") cfg->reconnect_min_backoff_ms = std::stoi(val);
         else if (key == "reconnect_max_backoff_ms") cfg->reconnect_max_backoff_ms = std::stoi(val);
         else if (key == "ping_interval_sec") cfg->ping_interval_sec = std::stoi(val);
+        else if (key == "auto_discover_assets") cfg->auto_discover_assets = (val == "true" || val == "1");
+        else if (key == "discover_trade_sample_size") cfg->discover_trade_sample_size = std::stoi(val);
+        else if (key == "discover_top_n") cfg->discover_top_n = std::stoi(val);
+        else if (key == "discover_refresh_interval_sec") cfg->discover_refresh_interval_sec = std::stoi(val);
         else if (key == "rpc_url") cfg->rpc_url = val;
         else if (key == "rpc_timeout_ms") cfg->rpc_timeout_ms = std::stol(val);
         else if (key == "rpc_poll_max_attempts") cfg->rpc_poll_max_attempts = std::stoi(val);
@@ -160,6 +170,10 @@ bool loadConfig(int argc, char** argv, AppConfig* cfg) {
         else if (arg == "--reconnect-min-backoff-ms") cfg->reconnect_min_backoff_ms = std::stoi(next(arg.c_str()));
         else if (arg == "--reconnect-max-backoff-ms") cfg->reconnect_max_backoff_ms = std::stoi(next(arg.c_str()));
         else if (arg == "--ping-interval-sec") cfg->ping_interval_sec = std::stoi(next(arg.c_str()));
+        else if (arg == "--auto-discover-assets") cfg->auto_discover_assets = true;
+        else if (arg == "--discover-trade-sample-size") cfg->discover_trade_sample_size = std::stoi(next(arg.c_str()));
+        else if (arg == "--discover-top-n") cfg->discover_top_n = std::stoi(next(arg.c_str()));
+        else if (arg == "--discover-refresh-interval-sec") cfg->discover_refresh_interval_sec = std::stoi(next(arg.c_str()));
         else if (arg == "--rpc-url") cfg->rpc_url = next("--rpc-url");
         else if (arg == "--rpc-timeout-ms") cfg->rpc_timeout_ms = std::stol(next(arg.c_str()));
         else if (arg == "--rpc-poll-max-attempts") cfg->rpc_poll_max_attempts = std::stoi(next(arg.c_str()));
@@ -190,9 +204,18 @@ bool loadConfig(int argc, char** argv, AppConfig* cfg) {
     }
 
     // --- validation ---
+    if (cfg->auto_discover_assets && !cfg->asset_ids.empty()) {
+        std::fprintf(stderr,
+            "warning: both --asset-ids and --auto-discover-assets set; --asset-ids wins, "
+            "auto-discovery skipped\n");
+        cfg->auto_discover_assets = false;
+    }
+
     if (cfg->dump_raw_messages <= 0) {
-        if (cfg->asset_ids.empty()) {
-            std::fprintf(stderr, "error: --asset-ids is required (comma-separated token ids to subscribe to)\n");
+        if (cfg->asset_ids.empty() && !cfg->auto_discover_assets) {
+            std::fprintf(stderr,
+                "error: --asset-ids or --auto-discover-assets is required "
+                "(comma-separated token ids to subscribe to, or pick them from current activity)\n");
             return false;
         }
         if (cfg->match_mode != MatchMode::Off && cfg->rpc_url.empty()) {
@@ -212,8 +235,10 @@ bool loadConfig(int argc, char** argv, AppConfig* cfg) {
             // matching still works. Logged clearly at startup in main.cpp.
         }
     } else {
-        if (cfg->asset_ids.empty()) {
-            std::fprintf(stderr, "error: --asset-ids is required even in --dump-raw-messages mode\n");
+        if (cfg->asset_ids.empty() && !cfg->auto_discover_assets) {
+            std::fprintf(stderr,
+                "error: --asset-ids or --auto-discover-assets is required even in "
+                "--dump-raw-messages mode\n");
             return false;
         }
     }

@@ -43,6 +43,7 @@ FetchContent_MakeAvailable(ixwebsocket nlohmann_json)
 add_executable(poly_lag_tracker
   src/main.cpp
   src/config.cpp
+  src/discovery.cpp
   src/logging.cpp
   src/trade_event.cpp
   src/ws_listener.cpp

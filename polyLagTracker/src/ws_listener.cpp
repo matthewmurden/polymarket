@@ -28,6 +28,7 @@ void WsListener::setTradeCallback(TradeCallback cb) { tradeCb_ = std::move(cb); 
 void WsListener::setRawCallback(RawCallback cb) { rawCb_ = std::move(cb); }
 
 std::string WsListener::buildSubscribeMessage() const {
+    std::lock_guard<std::mutex> lock(assetIdsMtx_);
     std::ostringstream oss;
     oss << "{\"assets_ids\":[";
     for (size_t i = 0; i < assetIds_.size(); ++i) {
@@ -36,6 +37,11 @@ std::string WsListener::buildSubscribeMessage() const {
     }
     oss << "],\"type\":\"market\"}";
     return oss.str();
+}
+
+std::vector<std::string> WsListener::currentAssetIds() const {
+    std::lock_guard<std::mutex> lock(assetIdsMtx_);
+    return assetIds_;
 }
 
 void WsListener::start() {
@@ -48,14 +54,15 @@ void WsListener::start() {
     ws.setPingInterval(pingIntervalSec_);
 
     const std::string subscribeMsg = buildSubscribeMessage();
+    const size_t assetCount = currentAssetIds().size();
 
-    ws.setOnMessageCallback([this, subscribeMsg](const ix::WebSocketMessagePtr& msg) {
+    ws.setOnMessageCallback([this, subscribeMsg, assetCount](const ix::WebSocketMessagePtr& msg) {
         switch (msg->type) {
             case ix::WebSocketMessageType::Open: {
                 connected_ = true;
                 uint64_t n = ++connectCount_;
                 logging::info("ws connected (connect #" + std::to_string(n) +
-                              "), sending subscribe for " + std::to_string(assetIds_.size()) + " asset id(s)");
+                              "), sending subscribe for " + std::to_string(assetCount) + " asset id(s)");
                 impl_->ws.send(subscribeMsg);
                 break;
             }
@@ -105,4 +112,21 @@ void WsListener::start() {
 
 void WsListener::stop() {
     impl_->ws.stop();
+}
+
+void WsListener::resubscribe(std::vector<std::string> newAssetIds) {
+    logging::info("resubscribe: closing current connection to apply an updated asset list (" +
+                  std::to_string(newAssetIds.size()) + " assets) -- Polymarket's market channel "
+                  "rejects a second subscribe message on an already-open connection (confirmed "
+                  "empirically: the server replies \"INVALID OPERATION\"), so there's no live "
+                  "add/remove; a fresh connection is required to change the watched set.");
+    // ix::WebSocket::stop() blocks until its background thread has fully
+    // quiesced, so it's safe to mutate assetIds_ immediately afterward --
+    // no message callback can still be in flight referencing the old list.
+    impl_->ws.stop();
+    {
+        std::lock_guard<std::mutex> lock(assetIdsMtx_);
+        assetIds_ = std::move(newAssetIds);
+    }
+    start();
 }

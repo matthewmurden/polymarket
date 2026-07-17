@@ -14,10 +14,22 @@ enum class MatchMode {
 struct AppConfig {
     // --- WebSocket ---
     std::string ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
-    std::vector<std::string> asset_ids;          // required unless dump_raw_messages is set
+    std::vector<std::string> asset_ids;          // required unless auto_discover_assets is set
     int reconnect_min_backoff_ms = 500;
     int reconnect_max_backoff_ms = 30000;
     int ping_interval_sec = 30;
+
+    // --- Auto-discovery of active markets ---
+    // Polymarket's highest-volume markets (e.g. the BTC/ETH/XRP 5-minute
+    // up/down markets) churn and get replaced every few minutes, so a
+    // hand-curated --asset-ids list goes stale fast. When set, asset_ids is
+    // populated at startup (and periodically refreshed) from a sample of
+    // recent trades instead of being supplied directly. If asset_ids is
+    // also non-empty, asset_ids wins and this is ignored (see loadConfig).
+    bool auto_discover_assets = false;
+    int discover_trade_sample_size = 500;    // trades sampled per discovery call
+    int discover_top_n = 40;                 // how many of the most-frequent assets to subscribe to
+    int discover_refresh_interval_sec = 1800; // 0 disables periodic refresh (startup discovery only)
 
     // --- Polygon RPC ---
     std::string rpc_url;                          // required (e.g. Alchemy/Infura/public RPC)
