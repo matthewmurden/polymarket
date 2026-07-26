@@ -31,6 +31,14 @@ public:
 
     std::optional<uint64_t> getLatestBlockNumber();
 
+    // eth_getTransactionReceipt. nullopt on transport failure; on success,
+    // the result is JSON null if the node doesn't know the hash yet (or it
+    // hasn't been mined), or an object with "blockNumber", "logs" (the full,
+    // unfiltered array of event logs emitted by the tx), "status", etc. once
+    // mined. Logs here are NOT pre-filtered by address/topic0 -- callers
+    // filter for the events they care about.
+    std::optional<nlohmann::json> getTransactionReceipt(const std::string& txHash);
+
     // eth_getLogs over [fromBlock, toBlock], filtered to one contract
     // address and topic0 (event signature hash). Returns the raw "result"
     // array of log objects.

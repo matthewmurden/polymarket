@@ -59,8 +59,13 @@ forever.
 4. Computes `lag_ms = ws_receipt_wall_clock_ms - block_timestamp_ms` and
    appends one row per trade to a CSV, flushed immediately so a crash loses
    at most the in-flight row.
-5. Logs connection health, message throughput, and running lag stats
-   (min/median/max so far) on a configurable interval.
+5. Also decodes the trader's wallet address for each trade directly from
+   the CTF Exchange V2 contract's `OrderFilled` event log in that same
+   transaction receipt (see "Wallet address resolution" below) -- the WS
+   payload itself doesn't carry one, and this needs no separate API call.
+6. Logs connection health, message throughput, running lag stats
+   (min/median/max so far), and wallet-resolution counts on a configurable
+   interval.
 
 ## Build
 
@@ -195,13 +200,65 @@ yourself), and `--match-mode fuzzy` fails fast at startup if they aren't.
 Given the live schema confirmation above (trade fills already carry a real
 tx hash), this path shouldn't be needed in practice -- treat it as a
 fallback for a schema change, not a routine mode. It also does **not**
-verify market/asset identity (decoding which token id was traded requires
-a bignum-correct comparison this tool doesn't attempt), only price/size/
-time proximity, and even the CTF-Exchange `OrderFilled` data-layout
-assumption baked into the decoder needs re-verifying against the exact
-event signature you configure. Rows resolved this way carry
+verify market/asset identity when picking the winning transaction out of a
+block range (decoding which token id was traded requires a bignum-correct
+comparison, which the *wallet* decoder below does, but this path's own
+price/size scoring doesn't cross-check it against the winning log), only
+price/size/time proximity. Rows resolved this way carry
 `match_method = fuzzy_log_scan` in the CSV specifically so you can filter
 them out (or weight them lower) in downstream analysis.
+
+### Wallet address resolution
+
+Polymarket's WS trade payload does **not** carry the trader's wallet
+address at all -- there's no field for it anywhere in a `last_trade_price`
+message, and the raw on-chain transaction's own `from`/`to` don't help
+either, since Polymarket executes trades through a relayer/proxy-wallet
+architecture where those fields reflect a shared operator address, not the
+end user.
+
+This tool decodes it a different way instead: the CTF Exchange V2 contract
+on Polygon (`0xe111180000d2663c0091e4f400237545b87b996b`) emits an
+`OrderFilled(bytes32 orderHash, address maker, address taker, uint8 side,
+uint256 tokenId, uint256 makerAmountFilled, uint256 takerAmountFilled,
+uint256 fee, bytes32 builder, bytes32 metadata)` event for every fill, and
+despite the relayer architecture above, **its `maker`/`taker` fields are
+the real trading wallets** -- confirmed by decoding this event from the
+same transaction receipt already fetched for on-chain confirmation and
+comparing the result against 83 known-correct `(tx_hash, proxyWallet)`
+pairs pulled from a live capture (back when this tool still used an
+earlier Data-API-based lookup): **83/83 correct, 0 wrong, 0 unresolved**,
+before that lookup was replaced with this. The event signature, the
+contract address, and the maker/taker semantics were all confirmed
+directly from `Polymarket/ctf-exchange-v2`'s own Solidity source
+(`Events.sol`/`Trading.sol`/`Structs.sol`), not guessed.
+
+Two things make this more than "read `maker`/`taker` off the log":
+- **A single settlement transaction can batch several unrelated fills**
+  into multiple `OrderFilled` logs (Polymarket batches matched orders for
+  gas efficiency), so the right log has to be picked out by exact `tokenId`
+  match plus price/size within tolerance against the WS-captured trade --
+  not just "the first `OrderFilled` log in the tx" or "any log mentioning
+  this address," either of which can silently pick the wrong fill when a
+  wallet happens to appear in more than one log in the same tx.
+- **The exchange also emits a redundant "mirror" log against itself** for
+  NegRisk mint/merge fills (`taker == the exchange contract's own
+  address`), re-stating the taker's own fill for internal bookkeeping. No
+  special-casing for this turned out to be necessary: comparing the
+  WS-captured `side` (BUY/SELL) to the log's decoded `side` (always the
+  *maker* order's side, per `Structs.sol`) and picking `maker` when they
+  match or `taker` when they don't resolves the correct wallet either way,
+  mirror log or not.
+
+This runs automatically wherever a transaction receipt (or, in
+`--match-mode fuzzy`, a matched block-range log) is already available --
+there's nothing to configure, retry, or opt out of. Unresolved trades are
+still written with an empty wallet field and a specific
+`wallet_resolve_note` (e.g. `no OrderFilled log matched this trade's
+tokenId+price/size`, or `ambiguous: 2 distinct wallets resolved across 2
+matching log(s)` if the tokenId+price/size match itself turned out
+ambiguous) rather than being dropped, per the tool's existing philosophy of
+never discarding a captured trade over a resolution failure.
 
 ## Output schema
 
@@ -226,6 +283,15 @@ One CSV row per trade fill, header included, UTF-8, RFC4180-ish quoting
 | `lag_ms` | `recv_wall_unix_ms - block_timestamp_unix*1000`; empty if unresolved. **Can be negative** -- in live testing, Polymarket routinely delivered the WS trade notification 1-3 seconds *before* the settlement transaction's block was mined, i.e. the off-chain match/notify happens before on-chain settlement confirms. That's real signal for the baseline this tool exists to produce, not a bug. |
 | `note` | human-readable reason when unresolved (pending confirmation, no fuzzy match in range, etc.) |
 | `raw_json` | the verbatim WS payload for this one trade object, for reprocessing if the schema needs revisiting |
+| `wallet_address` | trader's wallet, decoded from the `OrderFilled` log's maker/taker field, empty if unresolved -- see "Wallet address resolution" above |
+| `wallet_resolved` | `true`/`false` |
+| `wallet_resolve_note` | reason when unresolved, or how it was resolved (matching log count) |
+
+The wallet columns were appended at the end of the pre-existing schema,
+keeping every prior column unchanged and in position. If you point
+`--output` at a CSV written before this feature existed, its older rows
+won't have these three trailing fields -- start a fresh output file when
+adopting wallet resolution rather than resuming into an old one.
 
 ## Notes / limitations
 
@@ -239,7 +305,10 @@ One CSV row per trade fill, header included, UTF-8, RFC4180-ish quoting
   blocking the WS callback thread -- that thread needs to stay responsive
   for reconnects/pings. Watch `queue_dropped` in the periodic health log;
   a nonzero, growing value means `--worker-threads` or `--rpc-timeout-ms`
-  need tuning for your trade volume.
+  need tuning for your trade volume. Wallet resolution no longer adds any
+  separate network call or retry budget to this pipeline (it's decoded
+  from the receipt already fetched for on-chain confirmation), so it's not
+  an independent source of backlog the way the earlier Data-API lookup was.
 - A tx pending past `rpc_poll_max_attempts` polls is recorded as
   unresolved (`note` explains why) rather than retried indefinitely or in
   a later pass -- there's no offline reprocessing step in this version.

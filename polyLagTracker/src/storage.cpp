@@ -48,7 +48,8 @@ CsvStorage::CsvStorage(const std::string& path) {
         out_ << "recv_wall_iso,recv_wall_unix_ms,day_of_week,hour_of_day,"
                 "market,asset_id,side,price,size,payload_timestamp,"
                 "tx_hash,match_method,resolved,block_number,block_timestamp_unix,"
-                "lag_ms,note,raw_json\n";
+                "lag_ms,note,raw_json,"
+                "wallet_address,wallet_resolved,wallet_resolve_note\n";
         out_.flush();
     }
 }
@@ -59,6 +60,7 @@ void CsvStorage::appendRow(const OutputRow& row) {
 
     const auto& trade = row.trade;
     const auto& res = row.resolution;
+    const auto& wallet = row.wallet;
 
     auto wallTimeT = std::chrono::system_clock::to_time_t(trade.recv_wall);
     auto wallMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -96,6 +98,9 @@ void CsvStorage::appendRow(const OutputRow& row) {
          << (res.resolved ? std::to_string(res.block_timestamp_unix) : "") << ","
          << lagMsStr << ","
          << csvEscape(res.note) << ","
-         << csvEscape(trade.raw_json) << "\n";
+         << csvEscape(trade.raw_json) << ","
+         << csvEscape(wallet.wallet_address) << ","
+         << (wallet.resolved ? "true" : "false") << ","
+         << csvEscape(wallet.note) << "\n";
     out_.flush();
 }

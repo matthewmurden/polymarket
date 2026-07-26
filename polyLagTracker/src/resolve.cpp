@@ -37,32 +37,35 @@ double parseDoubleOr(const std::string& s, double fallback) {
     }
 }
 
-// Decodes one eth_getLogs entry assuming Polymarket CTF Exchange's
-// OrderFilled layout: 3 indexed topics (orderHash, maker, taker) and data =
-// makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled, fee,
-// each a 32-byte word. If cfg.order_filled_topic0 actually corresponds to a
-// different event, this decode will be silently wrong -- verify against a
-// known real fill on Polygonscan before trusting fuzzy-matched rows.
+// Decodes one eth_getLogs entry's price/size assuming Polymarket CTF
+// Exchange's real OrderFilled layout, confirmed directly from
+// Polymarket/ctf-exchange-v2's Events.sol/Trading.sol source (see
+// wallet_resolve.cpp for the full reasoning): 3 indexed topics (orderHash,
+// maker, taker) and data = side, tokenId, makerAmountFilled,
+// takerAmountFilled, fee, builder, metadata (7 32-byte words; only the
+// first four matter here). This does NOT verify tokenId/market identity,
+// only price and size -- see the FuzzyLogScan doc comment above for why
+// that's a known, deliberate limitation of this path specifically.
 bool decodeOrderFilled(const json& log, double* outPrice, double* outSize) {
     if (!log.contains("data") || !log["data"].is_string()) return false;
     std::string data = log["data"].get<std::string>();
     if (data.size() > 2 && data[0] == '0' && (data[1] == 'x' || data[1] == 'X')) data = data.substr(2);
-    if (data.size() < 5 * 64) return false;
+    if (data.size() < 4 * 64) return false;
 
     auto word = [&](int idx) { return data.substr(idx * 64, 64); };
-    double makerAssetId = hexWordToDouble(word(0));
-    double takerAssetId = hexWordToDouble(word(1));
     double makerAmount = hexWordToDouble(word(2));
     double takerAmount = hexWordToDouble(word(3));
-
     if (makerAmount <= 0 || takerAmount <= 0) return false;
 
-    // USDC and Polymarket outcome tokens are both 6-decimal, so the ratio
-    // between raw amounts already equals the human price -- no descaling
-    // needed there. Size (share count) is descaled by 1e6 to match the
-    // human-readable units Polymarket's WS/REST report.
-    if (makerAssetId == 0.0) {
-        *outPrice = makerAmount / takerAmount;
+    // USDC and Polymarket outcome tokens are both 6-decimal, so maker/taker
+    // amounts scale the same way; nothing in the event says which side is
+    // the collateral leg. Polymarket prices always fall in (0,1], and at
+    // most one of the two orientations can (they're reciprocals of each
+    // other), so picking whichever lands in that range is a deterministic,
+    // not-guessed way to pick the right one.
+    double priceA = makerAmount / takerAmount;
+    if (priceA > 0 && priceA <= 1.0) {
+        *outPrice = priceA;
         *outSize = takerAmount / 1e6;
     } else {
         *outPrice = takerAmount / makerAmount;
@@ -80,12 +83,21 @@ OnChainResolution resolveViaTxHash(PolygonRpcClient& client, const TradeEvent& t
     for (int attempt = 0; attempt < cfg.rpc_poll_max_attempts; ++attempt) {
         if (stopped(stopRequested)) {
             r.note = "shutdown requested during tx-hash poll";
+            r.wallet.note = "shutdown requested before a receipt was fetched";
             return r;
         }
 
-        auto txOpt = client.getTransactionByHash(trade.tx_hash);
-        if (txOpt && !txOpt->is_null() && txOpt->contains("blockNumber") && !(*txOpt)["blockNumber"].is_null()) {
-            std::string blockNumHex = (*txOpt)["blockNumber"].get<std::string>();
+        // eth_getTransactionReceipt instead of eth_getTransactionByHash --
+        // same call slot (still gives blockNumber for the timestamp lookup
+        // below), but its "logs" also let the wallet decode below happen
+        // with no separate RPC call.
+        auto receiptOpt = client.getTransactionReceipt(trade.tx_hash);
+        if (receiptOpt && !receiptOpt->is_null() && receiptOpt->contains("blockNumber") &&
+            !(*receiptOpt)["blockNumber"].is_null()) {
+            std::string blockNumHex = (*receiptOpt)["blockNumber"].get<std::string>();
+
+            r.wallet = resolveWalletFromLogs(receiptOpt->value("logs", json::array()), trade);
+
             auto blockOpt = client.getBlockByNumber(blockNumHex);
             if (blockOpt && blockOpt->contains("timestamp")) {
                 r.resolved = true;
@@ -104,6 +116,7 @@ OnChainResolution resolveViaTxHash(PolygonRpcClient& client, const TradeEvent& t
 
     r.note = "tx not mined after " + std::to_string(cfg.rpc_poll_max_attempts) +
              " poll(s) (still pending, or hash not known to this node)";
+    r.wallet.note = "no receipt available (tx never mined within the poll budget)";
     return r;
 }
 
@@ -180,6 +193,15 @@ OnChainResolution resolveViaFuzzyLogScan(PolygonRpcClient& client, const TradeEv
         return r;
     }
 
+    // Wallet decode reuses the same getLogs response already fetched above
+    // -- no separate RPC call -- filtered down to just the winning tx's own
+    // logs (a block-range scan spans many unrelated transactions).
+    json matchedTxLogs = json::array();
+    for (const auto& log : *logsOpt) {
+        if (log.value("transactionHash", "") == bestTxHash) matchedTxLogs.push_back(log);
+    }
+    r.wallet = resolveWalletFromLogs(matchedTxLogs, trade);
+
     auto blockOpt = client.getBlockByNumber(bestBlockHex);
     if (!blockOpt || !blockOpt->contains("timestamp")) {
         r.note = "fuzzy match found but block timestamp lookup failed";
@@ -201,6 +223,7 @@ OnChainResolution resolveTrade(PolygonRpcClient& client, const TradeEvent& trade
     if (cfg.match_mode == MatchMode::Off) {
         OnChainResolution r;
         r.note = "match_mode=off";
+        r.wallet.note = "match_mode=off, no receipt fetched to decode wallet from";
         return r;
     }
 
@@ -228,5 +251,6 @@ OnChainResolution resolveTrade(PolygonRpcClient& client, const TradeEvent& trade
 
     OnChainResolution r;
     r.note = haveTxHash ? "match_mode excludes tx-hash path" : "no tx hash in payload and fuzzy match not configured/allowed";
+    r.wallet.note = "no receipt/logs fetched to decode wallet from (" + r.note + ")";
     return r;
 }

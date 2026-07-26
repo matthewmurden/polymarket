@@ -33,6 +33,7 @@
 #include "rpc_client.hpp"
 #include "storage.hpp"
 #include "trade_event.hpp"
+#include "wallet_resolve.hpp"
 #include "ws_listener.hpp"
 
 namespace {
@@ -285,7 +286,8 @@ int runDumpRawMessages(const AppConfig& cfg) {
     return 0;
 }
 
-void logStatsSnapshot(const WsListener& ws, const TradeQueue& queue, const RunningLagStats& stats) {
+void logStatsSnapshot(const WsListener& ws, const TradeQueue& queue, const RunningLagStats& stats,
+                      uint64_t walletResolved, uint64_t walletUnresolved) {
     auto snap = stats.snapshot();
     logging::info(
         "health: connected=" + std::string(ws.isConnected() ? "yes" : "no") +
@@ -300,7 +302,9 @@ void logStatsSnapshot(const WsListener& ws, const TradeQueue& queue, const Runni
                " median_ms=" + std::to_string(snap.median) +
                " mean_ms=" + std::to_string(snap.mean) +
                " max_ms=" + std::to_string(snap.max)
-             : ""));
+             : "") +
+        " | wallet_resolved=" + std::to_string(walletResolved) +
+        " wallet_unresolved=" + std::to_string(walletUnresolved));
 }
 
 } // namespace
@@ -353,6 +357,8 @@ int main(int argc, char** argv) {
     CsvStorage storage(cfg.output_path);
     TradeQueue queue(static_cast<size_t>(cfg.queue_max_size));
     RunningLagStats lagStats;
+    std::atomic<uint64_t> walletResolvedCount{0};
+    std::atomic<uint64_t> walletUnresolvedCount{0};
 
     WsListener ws(cfg.ws_url, cfg.asset_ids, cfg.reconnect_min_backoff_ms,
                   cfg.reconnect_max_backoff_ms, cfg.ping_interval_sec);
@@ -369,7 +375,15 @@ int main(int argc, char** argv) {
                     if (g_stopRequested.load()) break;
                     continue;
                 }
+
+                // Wallet resolution now happens inside resolveTrade() itself
+                // -- decoded straight from the same on-chain receipt/logs
+                // already fetched for block-timestamp confirmation, not as
+                // a separate delayed Data-API retry loop. See
+                // wallet_resolve.hpp/resolve.cpp.
                 OnChainResolution resolution = resolveTrade(rpc, trade, cfg, &g_stopRequested);
+                if (resolution.wallet.resolved) ++walletResolvedCount; else ++walletUnresolvedCount;
+
                 if (resolution.resolved) {
                     int64_t wallMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                           trade.recv_wall.time_since_epoch()).count();
@@ -377,7 +391,7 @@ int main(int argc, char** argv) {
                                     static_cast<double>(resolution.block_timestamp_unix) * 1000.0;
                     lagStats.add(lagMs);
                 }
-                storage.appendRow(OutputRow{trade, resolution});
+                storage.appendRow(OutputRow{trade, resolution, resolution.wallet});
             }
         });
     }
@@ -389,7 +403,7 @@ int main(int argc, char** argv) {
                                [] { return g_stopRequested.load(); });
             if (g_stopRequested.load()) break;
             lock.unlock();
-            logStatsSnapshot(ws, queue, lagStats);
+            logStatsSnapshot(ws, queue, lagStats, walletResolvedCount.load(), walletUnresolvedCount.load());
             lock.lock();
         }
     });
@@ -424,7 +438,7 @@ int main(int argc, char** argv) {
     statsThread.join();
     if (discoveryThread.joinable()) discoveryThread.join();
 
-    logStatsSnapshot(ws, queue, lagStats);
+    logStatsSnapshot(ws, queue, lagStats, walletResolvedCount.load(), walletUnresolvedCount.load());
     logging::info("shutdown complete.");
 
     ix::uninitNetSystem();

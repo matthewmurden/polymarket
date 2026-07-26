@@ -99,6 +99,12 @@ std::optional<json> PolygonRpcClient::getBlockByNumber(const std::string& hexBlo
     return result;
 }
 
+std::optional<json> PolygonRpcClient::getTransactionReceipt(const std::string& txHash) {
+    json result;
+    if (!call("eth_getTransactionReceipt", json::array({txHash}), &result)) return std::nullopt;
+    return result;
+}
+
 std::optional<uint64_t> PolygonRpcClient::getLatestBlockNumber() {
     json result;
     if (!call("eth_blockNumber", json::array(), &result)) return std::nullopt;

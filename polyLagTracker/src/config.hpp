@@ -63,6 +63,16 @@ struct AppConfig {
     // --- Safety ---
     bool force_unsynced_clock = false;
 
+    // --- Wallet resolution ---
+    // No config needed: wallet addresses are now decoded directly from the
+    // CTF Exchange V2 contract's OrderFilled event logs in the same
+    // eth_getTransactionReceipt call already made for on-chain confirmation
+    // above -- see wallet_resolve.hpp/cpp for how and why (validated
+    // against 83/83 known-correct wallets, replacing an earlier Data-API
+    // lookup that only resolved ~18% of trades due to that endpoint's
+    // unpredictable indexing lag). Always on whenever a receipt is
+    // available; nothing to opt into or tune.
+
     // --- Raw payload inspection mode ---
     // If > 0, connects, subscribes, writes this many raw WS payloads to
     // dump_raw_path, then exits. No RPC calls, no storage writes. Use this

@@ -51,6 +51,7 @@ add_executable(poly_lag_tracker
   src/resolve.cpp
   src/storage.cpp
   src/ntp_check.cpp
+  src/wallet_resolve.cpp
 )
 
 target_include_directories(poly_lag_tracker PRIVATE src)

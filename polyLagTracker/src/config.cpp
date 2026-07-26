@@ -74,6 +74,10 @@ void printUsage(const char* prog) {
         "  --force-unsynced-clock           proceed even if system clock isn't NTP-synced (NOT recommended)\n"
         "  --dump-raw-messages N            write N raw WS payloads to --dump-raw-path, then exit\n"
         "  --dump-raw-path PATH             default raw_messages.jsonl\n"
+        "\n"
+        "  (wallet address resolution is always on and needs no configuration --\n"
+        "   it's decoded from the same on-chain receipt used for tx confirmation,\n"
+        "   see README \"Wallet address resolution\")\n"
         "  --help                           show this message\n",
         prog);
 }
