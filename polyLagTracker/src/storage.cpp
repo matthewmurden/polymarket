@@ -49,7 +49,10 @@ CsvStorage::CsvStorage(const std::string& path) {
                 "market,asset_id,side,price,size,payload_timestamp,"
                 "tx_hash,match_method,resolved,block_number,block_timestamp_unix,"
                 "lag_ms,note,raw_json,"
-                "wallet_address,wallet_resolved,wallet_resolve_note\n";
+                "wallet_address,wallet_resolved,wallet_resolve_note,"
+                "anomaly_size_score,anomaly_age_score,anomaly_concentration_score,"
+                "anomaly_total_score,anomaly_flagged,anomaly_note,"
+                "wallet_frequency_tier,anomaly_scope\n";
         out_.flush();
     }
 }
@@ -61,6 +64,7 @@ void CsvStorage::appendRow(const OutputRow& row) {
     const auto& trade = row.trade;
     const auto& res = row.resolution;
     const auto& wallet = row.wallet;
+    const auto& anomaly = row.anomaly;
 
     auto wallTimeT = std::chrono::system_clock::to_time_t(trade.recv_wall);
     auto wallMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -101,6 +105,14 @@ void CsvStorage::appendRow(const OutputRow& row) {
          << csvEscape(trade.raw_json) << ","
          << csvEscape(wallet.wallet_address) << ","
          << (wallet.resolved ? "true" : "false") << ","
-         << csvEscape(wallet.note) << "\n";
+         << csvEscape(wallet.note) << ","
+         << (anomaly.computed ? std::to_string(anomaly.size_score) : "") << ","
+         << (anomaly.computed ? std::to_string(anomaly.age_score) : "") << ","
+         << (anomaly.computed ? std::to_string(anomaly.concentration_score) : "") << ","
+         << (anomaly.computed ? std::to_string(anomaly.total_score) : "") << ","
+         << (anomaly.computed ? (anomaly.flagged ? "true" : "false") : "") << ","
+         << csvEscape(anomaly.note) << ","
+         << csvEscape(anomaly.tier) << ","
+         << csvEscape(anomaly.scope) << "\n";
     out_.flush();
 }

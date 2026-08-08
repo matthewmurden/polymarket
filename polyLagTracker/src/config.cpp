@@ -49,7 +49,16 @@ void printUsage(const char* prog) {
         "                                   of a fixed --asset-ids list (ignored if --asset-ids is also set)\n"
         "  --discover-trade-sample-size N   trades sampled per discovery call (default 500)\n"
         "  --discover-top-n N               how many of the most-frequent assets to subscribe to (default 40)\n"
-        "  --discover-refresh-interval-sec N  re-run discovery this often, 0 disables refresh (default 1800)\n"
+        "  --discover-refresh-interval-sec N  re-run discovery this often, 0 disables refresh (default 1800;\n"
+        "                                   auto-bumped to 14400 for --discover-by-category unless set explicitly)\n"
+        "\n"
+        "  --discover-by-category          subscribe to every OPEN market under --discover-tags, regardless\n"
+        "                                   of trade volume, instead of --auto-discover-assets' top-N-by-volume\n"
+        "                                   (mutually exclusive with --auto-discover-assets; see README\n"
+        "                                   \"Category-based market discovery\")\n"
+        "  --discover-tags T1,T2,...        Gamma API tag slugs to discover under (default: a curated\n"
+        "                                   politics/geopolitics/military/elections/regulatory set,\n"
+        "                                   confirmed live -- see README)\n"
         "\n"
         "  --rpc-url URL                    Polygon JSON-RPC endpoint (required unless --match-mode off)\n"
         "  --rpc-timeout-ms N               per-call RPC timeout (default 8000)\n"
@@ -78,6 +87,14 @@ void printUsage(const char* prog) {
         "  (wallet address resolution is always on and needs no configuration --\n"
         "   it's decoded from the same on-chain receipt used for tx confirmation,\n"
         "   see README \"Wallet address resolution\")\n"
+        "\n"
+        "  --wallet-history-db PATH        SQLite cache for wallet history/anomaly scoring (default wallet_history.db)\n"
+        "  --anomaly-score-flag-threshold F  combined score at/above which a trade is flagged (default 0.7)\n"
+        "\n"
+        "  --segment-low-max-trades N        Low tier: trade_count ceiling (default 50)\n"
+        "  --segment-low-max-trades-per-day F  Low tier: trades/day ceiling (default 5.0)\n"
+        "  --segment-high-min-trades N       High tier: trade_count floor (default 2000)\n"
+        "  --segment-high-min-trades-per-day F High tier: trades/day floor (default 50.0)\n"
         "  --help                           show this message\n",
         prog);
 }
@@ -105,6 +122,8 @@ bool loadConfigFile(const std::string& path, AppConfig* cfg) {
         else if (key == "discover_trade_sample_size") cfg->discover_trade_sample_size = std::stoi(val);
         else if (key == "discover_top_n") cfg->discover_top_n = std::stoi(val);
         else if (key == "discover_refresh_interval_sec") cfg->discover_refresh_interval_sec = std::stoi(val);
+        else if (key == "discover_by_category") cfg->discover_by_category = (val == "true" || val == "1");
+        else if (key == "discover_tags") cfg->discover_tags = splitCsv(val);
         else if (key == "rpc_url") cfg->rpc_url = val;
         else if (key == "rpc_timeout_ms") cfg->rpc_timeout_ms = std::stol(val);
         else if (key == "rpc_poll_max_attempts") cfg->rpc_poll_max_attempts = std::stoi(val);
@@ -129,6 +148,12 @@ bool loadConfigFile(const std::string& path, AppConfig* cfg) {
         else if (key == "force_unsynced_clock") cfg->force_unsynced_clock = (val == "true" || val == "1");
         else if (key == "dump_raw_messages") cfg->dump_raw_messages = std::stoi(val);
         else if (key == "dump_raw_path") cfg->dump_raw_path = val;
+        else if (key == "wallet_history_db_path") cfg->wallet_history_db_path = val;
+        else if (key == "anomaly_score_flag_threshold") cfg->anomaly_score_flag_threshold = std::stod(val);
+        else if (key == "segment_low_max_trades") cfg->segment_low_max_trades = std::stoull(val);
+        else if (key == "segment_low_max_trades_per_day") cfg->segment_low_max_trades_per_day = std::stod(val);
+        else if (key == "segment_high_min_trades") cfg->segment_high_min_trades = std::stoull(val);
+        else if (key == "segment_high_min_trades_per_day") cfg->segment_high_min_trades_per_day = std::stod(val);
         else std::fprintf(stderr, "warning: unknown config key '%s' ignored\n", key.c_str());
     }
     return true;
@@ -178,6 +203,8 @@ bool loadConfig(int argc, char** argv, AppConfig* cfg) {
         else if (arg == "--discover-trade-sample-size") cfg->discover_trade_sample_size = std::stoi(next(arg.c_str()));
         else if (arg == "--discover-top-n") cfg->discover_top_n = std::stoi(next(arg.c_str()));
         else if (arg == "--discover-refresh-interval-sec") cfg->discover_refresh_interval_sec = std::stoi(next(arg.c_str()));
+        else if (arg == "--discover-by-category") cfg->discover_by_category = true;
+        else if (arg == "--discover-tags") cfg->discover_tags = splitCsv(next(arg.c_str()));
         else if (arg == "--rpc-url") cfg->rpc_url = next("--rpc-url");
         else if (arg == "--rpc-timeout-ms") cfg->rpc_timeout_ms = std::stol(next(arg.c_str()));
         else if (arg == "--rpc-poll-max-attempts") cfg->rpc_poll_max_attempts = std::stoi(next(arg.c_str()));
@@ -203,23 +230,57 @@ bool loadConfig(int argc, char** argv, AppConfig* cfg) {
         else if (arg == "--force-unsynced-clock") cfg->force_unsynced_clock = true;
         else if (arg == "--dump-raw-messages") cfg->dump_raw_messages = std::stoi(next(arg.c_str()));
         else if (arg == "--dump-raw-path") cfg->dump_raw_path = next("--dump-raw-path");
+        else if (arg == "--wallet-history-db") cfg->wallet_history_db_path = next(arg.c_str());
+        else if (arg == "--anomaly-score-flag-threshold") cfg->anomaly_score_flag_threshold = std::stod(next(arg.c_str()));
+        else if (arg == "--segment-low-max-trades") cfg->segment_low_max_trades = std::stoull(next(arg.c_str()));
+        else if (arg == "--segment-low-max-trades-per-day") cfg->segment_low_max_trades_per_day = std::stod(next(arg.c_str()));
+        else if (arg == "--segment-high-min-trades") cfg->segment_high_min_trades = std::stoull(next(arg.c_str()));
+        else if (arg == "--segment-high-min-trades-per-day") cfg->segment_high_min_trades_per_day = std::stod(next(arg.c_str()));
         else if (arg == "--help" || arg == "-h") { printUsage(argv[0]); return false; }
         else { std::fprintf(stderr, "unknown argument: %s\n", arg.c_str()); printUsage(argv[0]); return false; }
     }
 
     // --- validation ---
-    if (cfg->auto_discover_assets && !cfg->asset_ids.empty()) {
+    if (cfg->auto_discover_assets && cfg->discover_by_category) {
         std::fprintf(stderr,
-            "warning: both --asset-ids and --auto-discover-assets set; --asset-ids wins, "
-            "auto-discovery skipped\n");
+            "error: --auto-discover-assets and --discover-by-category are mutually exclusive "
+            "(volume-based vs. category-based discovery are two different, incompatible ways to "
+            "pick the subscription set) -- pass at most one\n");
+        return false;
+    }
+
+    if ((cfg->auto_discover_assets || cfg->discover_by_category) && !cfg->asset_ids.empty()) {
+        std::fprintf(stderr,
+            "warning: --asset-ids set alongside a discovery mode; --asset-ids wins, "
+            "discovery skipped\n");
         cfg->auto_discover_assets = false;
+        cfg->discover_by_category = false;
+    }
+
+    if (cfg->discover_by_category && cfg->discover_tags.empty()) {
+        std::fprintf(stderr, "error: --discover-by-category requires at least one tag in --discover-tags\n");
+        return false;
+    }
+
+    // Category-resolved markets change composition far less often than the
+    // 5-minute crypto markets volume-based discovery targets -- default to
+    // a much longer refresh interval for this mode, but only if the user
+    // hasn't already asked for a specific value (1800 is the compiled-in
+    // volume-mode default; if it's still exactly that, nothing overrode it).
+    if (cfg->discover_by_category && cfg->discover_refresh_interval_sec == 1800) {
+        cfg->discover_refresh_interval_sec = 14400;
+        std::fprintf(stderr,
+            "info: --discover-by-category with no explicit --discover-refresh-interval-sec -- "
+            "using 14400s (4h) instead of the volume-mode default of 1800s (30min), since "
+            "category-resolved markets change far less often. Pass --discover-refresh-interval-sec "
+            "explicitly to override.\n");
     }
 
     if (cfg->dump_raw_messages <= 0) {
-        if (cfg->asset_ids.empty() && !cfg->auto_discover_assets) {
+        if (cfg->asset_ids.empty() && !cfg->auto_discover_assets && !cfg->discover_by_category) {
             std::fprintf(stderr,
-                "error: --asset-ids or --auto-discover-assets is required "
-                "(comma-separated token ids to subscribe to, or pick them from current activity)\n");
+                "error: --asset-ids, --auto-discover-assets, or --discover-by-category is required "
+                "(comma-separated token ids to subscribe to, or pick them automatically)\n");
             return false;
         }
         if (cfg->match_mode != MatchMode::Off && cfg->rpc_url.empty()) {
@@ -239,10 +300,10 @@ bool loadConfig(int argc, char** argv, AppConfig* cfg) {
             // matching still works. Logged clearly at startup in main.cpp.
         }
     } else {
-        if (cfg->asset_ids.empty() && !cfg->auto_discover_assets) {
+        if (cfg->asset_ids.empty() && !cfg->auto_discover_assets && !cfg->discover_by_category) {
             std::fprintf(stderr,
-                "error: --asset-ids or --auto-discover-assets is required even in "
-                "--dump-raw-messages mode\n");
+                "error: --asset-ids, --auto-discover-assets, or --discover-by-category is required "
+                "even in --dump-raw-messages mode\n");
             return false;
         }
     }

@@ -25,15 +25,22 @@
 #include <unordered_set>
 #include <vector>
 
+#include "anomaly_score.hpp"
 #include "config.hpp"
+#include "category_discovery.hpp"
 #include "discovery.hpp"
 #include "logging.hpp"
+#include "market_category.hpp"
 #include "ntp_check.hpp"
 #include "resolve.hpp"
 #include "rpc_client.hpp"
+#include "stage2_hook.hpp"
 #include "storage.hpp"
 #include "trade_event.hpp"
+#include "wallet_history_fetch.hpp"
+#include "wallet_history_store.hpp"
 #include "wallet_resolve.hpp"
+#include "wallet_segment.hpp"
 #include "ws_listener.hpp"
 
 namespace {
@@ -251,6 +258,93 @@ void refreshDiscoveredAssets(const AppConfig& cfg, WsListener* ws) {
     ws->resubscribe(newIds);
 }
 
+// --- category-based discovery ----------------------------------------------
+// Above a subscription list this size, log a loud warning rather than
+// silently proceeding -- confirmed live (see README "Category-based market
+// discovery") that a broad politics/geopolitics/elections tag set can
+// produce tens of thousands of outcome tokens, which is untested territory
+// for a single WS subscribe message and this tool's fixed worker pool.
+// This is a NOTE, not a cap: the tool still attempts the full list, since
+// silently truncating would defeat the point of category-based discovery
+// (watching every low-volume market a topic covers, not just the loudest
+// ones) -- but an operator needs to know this is happening.
+constexpr size_t kLargeSubscriptionWarnThreshold = 1000;
+
+void logIfSubscriptionLarge(size_t count) {
+    if (count < kLargeSubscriptionWarnThreshold) return;
+    logging::warn("discover-by-category: " + std::to_string(count) + " outcome token(s) to subscribe -- "
+                  "well above the " + std::to_string(kLargeSubscriptionWarnThreshold) + " token soft "
+                  "threshold this tool has been tested up to. This is a single WS subscribe message and "
+                  "a fixed-size worker pool (--worker-threads); watch queue_depth/connects/disconnects in "
+                  "the health log closely after startup to confirm the connection and throughput actually "
+                  "hold up at this scale, not just that the process starts.");
+}
+
+// Category-based counterpart to runInitialDiscoveryOrExit: populates
+// cfg->asset_ids from every currently open market under cfg->discover_tags
+// (see category_discovery.hpp), not ranked or capped by volume.
+bool runInitialCategoryDiscoveryOrExit(AppConfig* cfg) {
+    std::string tagList;
+    for (size_t i = 0; i < cfg->discover_tags.size(); ++i) {
+        if (i > 0) tagList += ",";
+        tagList += cfg->discover_tags[i];
+    }
+    logging::info("discover-by-category: fetching every open market under tag(s): " + tagList);
+
+    auto discovered = discoverAssetsByCategory(cfg->discover_tags, kDiscoveryTimeoutMs);
+    if (!discovered) {
+        logging::error("discover-by-category: could not determine any open markets (see discovery "
+                       "errors above). Check --discover-tags against the real /tags taxonomy, or pass "
+                       "--asset-ids explicitly instead if this keeps happening.");
+        return false;
+    }
+
+    cfg->asset_ids.clear();
+    cfg->asset_ids.reserve(discovered->size());
+    for (const auto& d : *discovered) cfg->asset_ids.push_back(d.asset_id);
+
+    logging::info("discover-by-category: subscribing to " + std::to_string(cfg->asset_ids.size()) +
+                  " outcome token(s)");
+    logIfSubscriptionLarge(cfg->asset_ids.size());
+    return true;
+}
+
+// Category-based counterpart to refreshDiscoveredAssets -- same
+// diff-and-resubscribe-only-if-changed shape, on the (typically much
+// longer, see config.hpp) --discover-refresh-interval-sec cadence.
+void refreshCategoryDiscoveredAssets(const AppConfig& cfg, WsListener* ws) {
+    auto discovered = discoverAssetsByCategory(cfg.discover_tags, kDiscoveryTimeoutMs);
+    if (!discovered) {
+        logging::error("discover-by-category refresh failed; keeping the current subscription "
+                       "unchanged (will retry at the next refresh interval)");
+        return;
+    }
+
+    std::vector<std::string> newIds;
+    newIds.reserve(discovered->size());
+    for (const auto& d : *discovered) newIds.push_back(d.asset_id);
+
+    std::vector<std::string> oldIds = ws->currentAssetIds();
+    std::unordered_set<std::string> oldSet(oldIds.begin(), oldIds.end());
+    std::unordered_set<std::string> newSet(newIds.begin(), newIds.end());
+
+    std::vector<std::string> added, dropped;
+    for (const auto& id : newIds) if (!oldSet.count(id)) added.push_back(id);
+    for (const auto& id : oldIds) if (!newSet.count(id)) dropped.push_back(id);
+
+    if (added.empty() && dropped.empty()) {
+        logging::info("discover-by-category refresh: no change to the subscribed market set (" +
+                      std::to_string(newIds.size()) + " token(s))");
+        return;
+    }
+
+    logging::info("discover-by-category refresh: " + std::to_string(added.size()) + " outcome token(s) "
+                  "added (newly open), " + std::to_string(dropped.size()) + " removed (closed/resolved) "
+                  "-- " + std::to_string(newIds.size()) + " total now subscribed");
+    logIfSubscriptionLarge(newIds.size());
+    ws->resubscribe(newIds);
+}
+
 // --- raw payload dump mode ------------------------------------------------
 int runDumpRawMessages(const AppConfig& cfg) {
     logging::info("dump-raw-messages mode: writing " + std::to_string(cfg.dump_raw_messages) +
@@ -286,8 +380,136 @@ int runDumpRawMessages(const AppConfig& cfg) {
     return 0;
 }
 
-void logStatsSnapshot(const WsListener& ws, const TradeQueue& queue, const RunningLagStats& stats,
-                      uint64_t walletResolved, uint64_t walletUnresolved) {
+// --- Stage 1: wallet history + anomaly scoring ----------------------------
+// Cache hit/miss/flagged counters, exposed in the periodic health log
+// alongside wallet_resolved/wallet_unresolved.
+struct Stage1Counters {
+    std::atomic<uint64_t> cacheHits{0};    // wallet already had a cached history record
+    std::atomic<uint64_t> cacheMisses{0};  // wallet needed a fresh Data API backfill
+    std::atomic<uint64_t> flagged{0};
+    std::atomic<uint64_t> unscored{0};     // backfill failed/was interrupted -- not a normal outcome, see note
+    // Per-trade tier classification counts (see wallet_segment.hpp) --
+    // counts classification EVENTS, not unique wallets, since a wallet's
+    // tier can drift as its history grows over a long run. For a true
+    // unique-wallet tier census, query the SQLite cache directly (see
+    // README "Wallet frequency segmentation").
+    std::atomic<uint64_t> tierLow{0};
+    std::atomic<uint64_t> tierMedium{0};
+    std::atomic<uint64_t> tierHigh{0};
+};
+
+uint64_t unixSecondsOf(std::chrono::system_clock::time_point tp) {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(tp.time_since_epoch()).count());
+}
+
+// Looks up (or backfills, on first sight) this wallet's history, classifies
+// its frequency tier (see wallet_segment.hpp) against that PRIOR history,
+// and routes accordingly: only Low-tier wallets get the existing
+// three-component score (against that same prior history -- see
+// anomaly_score.hpp for why prior, not post-fold, matters); Medium and
+// High are recorded as out of scope for this component rather than scored
+// -- see wallet_segment.hpp and README "Wallet frequency segmentation" for
+// why. Either way, this trade is then folded into the cached record and
+// persisted, so tier classification and (for Low wallets) scoring both
+// stay current for the wallet's next trade.
+//
+// `computed` is true only for the "scored" case; a wallet with zero real
+// prior trades is still a normal, scoreable Low-tier case (see
+// wallet_history_store.hpp) -- `computed=false` means either scoring
+// wasn't attempted (Medium/High, or wallet history unavailable) or is
+// otherwise out of scope, never a silent failure.
+//
+// Known limitation, deliberately not engineered around here: the
+// get-history / fold / persist sequence below is not atomic across worker
+// threads, so two trades from the same wallet processed concurrently by
+// different threads could race and one update could be lost. Given this is
+// exploratory Stage 1 scoring meant to be tuned against real data, not a
+// ledger of record, that's an acceptable simplicity trade-off for now --
+// see README "Wallet history store" for more.
+AnomalyScore scoreTradeStage1(const std::string& walletAddress, const TradeEvent& trade, WalletHistoryStore* store,
+                              const WalletHistoryFetchConfig& fetchCfg, const AnomalyScoreConfig& scoreCfg,
+                              const WalletSegmentConfig& segmentCfg, Stage1Counters* counters,
+                              const std::atomic<bool>* stopRequested) {
+    WalletHistoryRecord history = store->get(walletAddress);
+    if (!history.known) {
+        ++counters->cacheMisses;
+        history = fetchWalletHistoryBackfill(walletAddress, store, fetchCfg, stopRequested);
+        if (!history.known) {
+            ++counters->unscored;
+            AnomalyScore unscored;
+            unscored.scope = "unscored";
+            unscored.note = "wallet history backfill failed or was interrupted, not scored";
+            return unscored;
+        }
+    } else {
+        ++counters->cacheHits;
+    }
+
+    double size = 0.0;
+    try {
+        size = std::stod(trade.size);
+    } catch (const std::exception&) {
+        // leave size = 0.0; an unparseable size is rare (parseTradeEvent
+        // already required a non-empty size string) and scoring degrades
+        // gracefully rather than dropping the trade.
+    }
+
+    std::string category =
+        trade.market.empty() ? "unknown" : resolveMarketCategory(trade.market, store, fetchCfg.timeoutMs);
+
+    uint64_t tradeUnix = unixSecondsOf(trade.recv_wall);
+
+    WalletFrequencyTier tier = classifyWallet(history, tradeUnix, segmentCfg);
+    switch (tier) {
+        case WalletFrequencyTier::Low: ++counters->tierLow; break;
+        case WalletFrequencyTier::Medium: ++counters->tierMedium; break;
+        case WalletFrequencyTier::High: ++counters->tierHigh; break;
+    }
+
+    AnomalyScore score;
+    score.tier = tierToString(tier);
+
+    if (tier == WalletFrequencyTier::Low) {
+        score = computeAnomalyScore(history, size, category, tradeUnix, scoreCfg);
+        score.tier = tierToString(tier);
+        score.scope = "scored";
+        if (score.flagged) {
+            ++counters->flagged;
+            onWalletFlagged(walletAddress, score);
+        }
+    } else {
+        score.scope = tier == WalletFrequencyTier::High ? "excluded_high_frequency" : "excluded_medium_frequency";
+        score.note = "wallet classified as " + score.tier + "-frequency (trade_count=" +
+                     std::to_string(history.trade_count) + "), out of scope for this scorer -- see README "
+                     "\"Wallet frequency segmentation\"";
+    }
+
+    foldTradeIntoHistory(&history, size, category, tradeUnix);
+    history.last_updated_unix = tradeUnix;
+    store->upsert(history);
+
+    return score;
+}
+
+std::string discoveryModeLogFragment(const AppConfig& cfg, const WsListener& ws) {
+    if (cfg.discover_by_category) {
+        std::string tags;
+        for (size_t i = 0; i < cfg.discover_tags.size(); ++i) {
+            if (i > 0) tags += "+";
+            tags += cfg.discover_tags[i];
+        }
+        return " | discovery=category tags=" + tags +
+               " subscribed=" + std::to_string(ws.currentAssetIds().size());
+    }
+    if (cfg.auto_discover_assets) {
+        return " | discovery=volume subscribed=" + std::to_string(ws.currentAssetIds().size());
+    }
+    return " | discovery=manual subscribed=" + std::to_string(ws.currentAssetIds().size());
+}
+
+void logStatsSnapshot(const AppConfig& cfg, const WsListener& ws, const TradeQueue& queue,
+                      const RunningLagStats& stats, uint64_t walletResolved, uint64_t walletUnresolved,
+                      const Stage1Counters& stage1) {
     auto snap = stats.snapshot();
     logging::info(
         "health: connected=" + std::string(ws.isConnected() ? "yes" : "no") +
@@ -296,6 +518,7 @@ void logStatsSnapshot(const WsListener& ws, const TradeQueue& queue, const Runni
         " messages=" + std::to_string(ws.messagesReceived()) +
         " queue_depth=" + std::to_string(queue.size()) +
         " queue_dropped=" + std::to_string(queue.dropped()) +
+        discoveryModeLogFragment(cfg, ws) +
         " | resolved_lag_samples=" + std::to_string(snap.count) +
         (snap.count > 0
              ? " min_ms=" + std::to_string(snap.min) +
@@ -304,7 +527,14 @@ void logStatsSnapshot(const WsListener& ws, const TradeQueue& queue, const Runni
                " max_ms=" + std::to_string(snap.max)
              : "") +
         " | wallet_resolved=" + std::to_string(walletResolved) +
-        " wallet_unresolved=" + std::to_string(walletUnresolved));
+        " wallet_unresolved=" + std::to_string(walletUnresolved) +
+        " | stage1_cache_hits=" + std::to_string(stage1.cacheHits.load()) +
+        " stage1_cache_misses=" + std::to_string(stage1.cacheMisses.load()) +
+        " stage1_unscored=" + std::to_string(stage1.unscored.load()) +
+        " stage1_flagged=" + std::to_string(stage1.flagged.load()) +
+        " | stage1_tier_low=" + std::to_string(stage1.tierLow.load()) +
+        " stage1_tier_medium=" + std::to_string(stage1.tierMedium.load()) +
+        " stage1_tier_high=" + std::to_string(stage1.tierHigh.load()));
 }
 
 } // namespace
@@ -323,6 +553,12 @@ int main(int argc, char** argv) {
 
     if (cfg.auto_discover_assets) {
         if (!runInitialDiscoveryOrExit(&cfg)) {
+            ix::uninitNetSystem();
+            curl_global_cleanup();
+            return 1;
+        }
+    } else if (cfg.discover_by_category) {
+        if (!runInitialCategoryDiscoveryOrExit(&cfg)) {
             ix::uninitNetSystem();
             curl_global_cleanup();
             return 1;
@@ -360,6 +596,20 @@ int main(int argc, char** argv) {
     std::atomic<uint64_t> walletResolvedCount{0};
     std::atomic<uint64_t> walletUnresolvedCount{0};
 
+    // Stage 1: wallet history cache + anomaly scoring (see
+    // wallet_history_store.hpp/anomaly_score.hpp). One shared SQLite
+    // connection (internally mutex-guarded) across all worker threads.
+    WalletHistoryStore walletHistoryStore(cfg.wallet_history_db_path);
+    WalletHistoryFetchConfig walletFetchCfg;  // defaults: 500/page, 20 pages max, 8s timeout
+    AnomalyScoreConfig anomalyScoreCfg;
+    anomalyScoreCfg.flagThreshold = cfg.anomaly_score_flag_threshold;
+    WalletSegmentConfig segmentCfg;
+    segmentCfg.lowMaxTrades = cfg.segment_low_max_trades;
+    segmentCfg.lowMaxTradesPerDay = cfg.segment_low_max_trades_per_day;
+    segmentCfg.highMinTrades = cfg.segment_high_min_trades;
+    segmentCfg.highMinTradesPerDay = cfg.segment_high_min_trades_per_day;
+    Stage1Counters stage1Counters;
+
     WsListener ws(cfg.ws_url, cfg.asset_ids, cfg.reconnect_min_backoff_ms,
                   cfg.reconnect_max_backoff_ms, cfg.ping_interval_sec);
     ws.setTradeCallback([&queue](TradeEvent trade) { queue.push(std::move(trade)); });
@@ -391,7 +641,22 @@ int main(int argc, char** argv) {
                                     static_cast<double>(resolution.block_timestamp_unix) * 1000.0;
                     lagStats.add(lagMs);
                 }
-                storage.appendRow(OutputRow{trade, resolution, resolution.wallet});
+
+                // Stage 1 scoring needs a resolved wallet address to look
+                // up/build history against; a trade whose wallet didn't
+                // resolve this round is written with an unscored row
+                // rather than blocking on/retrying wallet resolution here.
+                AnomalyScore anomaly;
+                if (resolution.wallet.resolved) {
+                    anomaly = scoreTradeStage1(resolution.wallet.wallet_address, trade, &walletHistoryStore,
+                                               walletFetchCfg, anomalyScoreCfg, segmentCfg, &stage1Counters,
+                                               &g_stopRequested);
+                } else {
+                    anomaly.scope = "wallet_unresolved";
+                    anomaly.note = "wallet not resolved, not scored";
+                }
+
+                storage.appendRow(OutputRow{trade, resolution, resolution.wallet, anomaly});
             }
         });
     }
@@ -403,16 +668,16 @@ int main(int argc, char** argv) {
                                [] { return g_stopRequested.load(); });
             if (g_stopRequested.load()) break;
             lock.unlock();
-            logStatsSnapshot(ws, queue, lagStats, walletResolvedCount.load(), walletUnresolvedCount.load());
+            logStatsSnapshot(cfg, ws, queue, lagStats, walletResolvedCount.load(), walletUnresolvedCount.load(), stage1Counters);
             lock.lock();
         }
     });
 
-    // Only re-discovers on an interval when the asset list came from
-    // --auto-discover-assets in the first place -- a manually-specified
+    // Only re-discovers on an interval when the asset list came from a
+    // discovery mode in the first place -- a manually-specified
     // --asset-ids list stays static for the whole run, per spec.
     std::thread discoveryThread;
-    if (cfg.auto_discover_assets && cfg.discover_refresh_interval_sec > 0) {
+    if ((cfg.auto_discover_assets || cfg.discover_by_category) && cfg.discover_refresh_interval_sec > 0) {
         discoveryThread = std::thread([&] {
             std::unique_lock<std::mutex> lock(g_stopMutex);
             while (!g_stopRequested.load()) {
@@ -420,7 +685,11 @@ int main(int argc, char** argv) {
                                    [] { return g_stopRequested.load(); });
                 if (g_stopRequested.load()) break;
                 lock.unlock();
-                refreshDiscoveredAssets(cfg, &ws);
+                if (cfg.auto_discover_assets) {
+                    refreshDiscoveredAssets(cfg, &ws);
+                } else {
+                    refreshCategoryDiscoveredAssets(cfg, &ws);
+                }
                 lock.lock();
             }
         });
@@ -438,7 +707,7 @@ int main(int argc, char** argv) {
     statsThread.join();
     if (discoveryThread.joinable()) discoveryThread.join();
 
-    logStatsSnapshot(ws, queue, lagStats, walletResolvedCount.load(), walletUnresolvedCount.load());
+    logStatsSnapshot(cfg, ws, queue, lagStats, walletResolvedCount.load(), walletUnresolvedCount.load(), stage1Counters);
     logging::info("shutdown complete.");
 
     ix::uninitNetSystem();

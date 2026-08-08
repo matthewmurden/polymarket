@@ -5,17 +5,20 @@
 #include <mutex>
 #include <string>
 
+#include "anomaly_score.hpp"
 #include "resolve.hpp"
 #include "trade_event.hpp"
 #include "wallet_resolve.hpp"
 
 // One fully-processed row: a trade event, whatever on-chain resolution
-// (successful or not) was found for it, and whatever wallet-address lookup
-// (successful or not) was found for it.
+// (successful or not) was found for it, whatever wallet-address lookup
+// (successful or not) was found for it, and whatever Stage 1 anomaly score
+// (computed or not, see anomaly_score.hpp) resulted from it.
 struct OutputRow {
     TradeEvent trade;
     OnChainResolution resolution;
     WalletResolution wallet;
+    AnomalyScore anomaly;
 };
 
 // Appends rows to a CSV file, one flush per row so a crash loses at most

@@ -15,6 +15,7 @@ list(APPEND CMAKE_PREFIX_PATH /opt/homebrew/opt/curl /opt/homebrew/opt/openssl@3
 find_package(CURL REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
+find_package(SQLite3 REQUIRED)
 
 # --- IXWebSocket + nlohmann/json, pulled at configure time -------------
 # Same rationale as polyAreaTesting: not reliably packaged via apt/brew at
@@ -44,6 +45,7 @@ add_executable(poly_lag_tracker
   src/main.cpp
   src/config.cpp
   src/discovery.cpp
+  src/category_discovery.cpp
   src/logging.cpp
   src/trade_event.cpp
   src/ws_listener.cpp
@@ -52,6 +54,12 @@ add_executable(poly_lag_tracker
   src/storage.cpp
   src/ntp_check.cpp
   src/wallet_resolve.cpp
+  src/wallet_history_store.cpp
+  src/wallet_history_fetch.cpp
+  src/market_category.cpp
+  src/anomaly_score.cpp
+  src/wallet_segment.cpp
+  src/stage2_hook.cpp
 )
 
 target_include_directories(poly_lag_tracker PRIVATE src)
@@ -62,4 +70,5 @@ target_link_libraries(poly_lag_tracker PRIVATE
   OpenSSL::SSL
   OpenSSL::Crypto
   Threads::Threads
+  SQLite3::SQLite3
 )
